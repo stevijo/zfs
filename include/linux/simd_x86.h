@@ -126,38 +126,68 @@
 #endif
 
 #else /* defined(KERNEL_EXPORTS_X86_FPU) */
+
 /*
  * When the kernel_fpu_* symbols are unavailable then provide our own
  * versions which allow the FPU to be safely used in kernel threads.
  * In practice, this is not a significant restriction for ZFS since the
  * vast majority of SIMD operations are performed by the IO pipeline.
  */
+#if defined(HAVE_KERNEL_FPU_INTERNAL)
 
 /*
- * Returns non-zero if FPU operations are allowed in the current context.
+ * FPU usage only allowed in dedicated kernel threads.
  */
-#if defined(HAVE_KERNEL_TIF_NEED_FPU_LOAD)
-#define	kfpu_allowed()		((current->flags & PF_KTHREAD) && \
-				test_thread_flag(TIF_NEED_FPU_LOAD))
-#elif defined(HAVE_KERNEL_FPU_INITIALIZED)
-#define	kfpu_allowed()		((current->flags & PF_KTHREAD) && \
-				current->thread.fpu.initialized)
-#else
-#define	kfpu_allowed()		0
-#endif
+#define	kfpu_allowed()		(current->flags & PF_KTHREAD)
+#define	ex_handler_fprestore	ex_handler_default
+
+/*
+ * FPU save and restore instructions.
+ */
+#define	__asm			__asm__ __volatile__
+#define	kfpu_fxsave(addr)	__asm("fxsave %0" : "=m" (*(addr)))
+#define	kfpu_fxsaveq(addr)	__asm("fxsaveq %0" : "=m" (*(addr)))
+#define	kfpu_fnsave(addr)	__asm("fnsave %0; fwait" : "=m" (*(addr)))
+#define	kfpu_fxrstor(addr)	__asm("fxrstor %0" : : "m" (*(addr)))
+#define	kfpu_fxrstorq(addr)	__asm("fxrstorq %0" : : "m" (*(addr)))
+#define	kfpu_frstor(addr)	__asm("frstor %0" : : "m" (*(addr)))
+#define	kfpu_fxsr_clean(rval)	__asm("fnclex; emms; fildl %P[addr]" \
+				    : : [addr] "m" (rval));
 
 static inline void
 kfpu_initialize(void)
 {
 	WARN_ON_ONCE(!(current->flags & PF_KTHREAD));
 
-#if defined(HAVE_KERNEL_TIF_NEED_FPU_LOAD)
-	__fpu_invalidate_fpregs_state(&current->thread.fpu);
-	set_thread_flag(TIF_NEED_FPU_LOAD);
-#elif defined(HAVE_KERNEL_FPU_INITIALIZED)
-	__fpu_invalidate_fpregs_state(&current->thread.fpu);
-	current->thread.fpu.initialized = 1;
-#endif
+	/* Invalidate the task's FPU state */
+	current->thread.fpu.last_cpu = -1;
+}
+
+static inline void
+kfpu_save_xsave(struct xregs_state *addr, uint64_t mask)
+{
+	uint32_t low, hi;
+	int err;
+
+	low = mask;
+	hi = mask >> 32;
+	XSTATE_XSAVE(addr, low, hi, err);
+	WARN_ON_ONCE(err);
+}
+
+static inline void
+kfpu_save_fxsr(struct fxregs_state *addr)
+{
+	if (IS_ENABLED(CONFIG_X86_32))
+		kfpu_fxsave(addr);
+	else
+		kfpu_fxsaveq(addr);
+}
+
+static inline void
+kfpu_save_fsave(struct fregs_state *addr)
+{
+	kfpu_fnsave(addr);
 }
 
 static inline void
@@ -172,46 +202,86 @@ kfpu_begin(void)
 	preempt_disable();
 	local_irq_disable();
 
-#if defined(HAVE_KERNEL_TIF_NEED_FPU_LOAD)
 	/*
 	 * The current FPU registers need to be preserved by kfpu_begin()
-	 * and restored by kfpu_end().  This is required because we can
-	 * not call __cpu_invalidate_fpregs_state() to invalidate the
-	 * per-cpu FPU state and force them to be restored during a
-	 * context switch.
+	 * and restored by kfpu_end().  This is always required because we
+	 * can not call __cpu_invalidate_fpregs_state() to invalidate the
+	 * per-cpu FPU state and force them to be restored.  Furthermore,
+	 * this implementation relies on the space provided in the task
+	 * structure to store the user FPU state.  As such, it can only
+	 * be used with dedicated kernels which by definition will never
+	 * store user FPU state.
 	 */
-	copy_fpregs_to_fpstate(&current->thread.fpu);
-#elif defined(HAVE_KERNEL_FPU_INITIALIZED)
+	if (static_cpu_has(X86_FEATURE_XSAVE)) {
+		kfpu_save_xsave(&current->thread.fpu.state.xsave, ~0);
+	} else if (static_cpu_has(X86_FEATURE_FXSR)) {
+		kfpu_save_fxsr(&current->thread.fpu.state.fxsave);
+	} else {
+		kfpu_save_fsave(&current->thread.fpu.state.fsave);
+	}
+}
+
+static inline void
+kfpu_restore_xsave(struct xregs_state *addr, uint64_t mask)
+{
+	uint32_t low, hi;
+
+	low = mask;
+	hi = mask >> 32;
+	XSTATE_XRESTORE(addr, low, hi);
+}
+
+static inline void
+kfpu_restore_fxsr(struct fxregs_state *addr)
+{
 	/*
-	 * There is no need to preserve and restore the FPU registers.
-	 * They will always be restored from the task's stored FPU state
-	 * when switching contexts.
+	 * On AuthenticAMD K7 and K8 processors the fxrstor instruction only
+	 * restores the _x87 FOP, FIP, and FDP registers when an exception
+	 * is pending.  Clean the _x87 state to force the restore.
 	 */
-	WARN_ON_ONCE(current->thread.fpu.initialized == 0);
-#endif
+	if (unlikely(static_cpu_has_bug(X86_BUG_FXSAVE_LEAK)))
+		kfpu_fxsr_clean(addr);
+
+	if (IS_ENABLED(CONFIG_X86_32)) {
+		kfpu_fxrstor(addr);
+	} else {
+		kfpu_fxrstorq(addr);
+	}
+}
+
+static inline void
+kfpu_restore_fsave(struct fregs_state *addr)
+{
+	kfpu_frstor(addr);
 }
 
 static inline void
 kfpu_end(void)
 {
-#if defined(HAVE_KERNEL_TIF_NEED_FPU_LOAD)
-	union fpregs_state *state = &current->thread.fpu.state;
-	int error;
-
-	if (use_xsave()) {
-		error = copy_kernel_to_xregs_err(&state->xsave, -1);
-	} else if (use_fxsr()) {
-		error = copy_kernel_to_fxregs_err(&state->fxsave);
+	if (static_cpu_has(X86_FEATURE_XSAVE)) {
+		kfpu_restore_xsave(&current->thread.fpu.state.xsave, ~0);
+	} else if (static_cpu_has(X86_FEATURE_FXSR)) {
+		kfpu_restore_fxsr(&current->thread.fpu.state.fxsave);
 	} else {
-		error = copy_kernel_to_fregs_err(&state->fsave);
+		kfpu_restore_fsave(&current->thread.fpu.state.fsave);
 	}
-	WARN_ON_ONCE(error);
-#endif
 
 	local_irq_enable();
 	preempt_enable();
 }
-#endif /* defined(HAVE_KERNEL_FPU) */
+
+#else
+
+/*
+ * FPU support is unavailable.
+ */
+#define	kfpu_allowed()		0
+#define	kfpu_initialize(tsk)	do {} while (0)
+#define	kfpu_begin()		do {} while (0)
+#define	kfpu_end()		do {} while (0)
+
+#endif /* defined(HAVE_KERNEL_FPU_INTERNAL) */
+#endif /* defined(KERNEL_EXPORTS_X86_FPU) */
 
 #else /* defined(_KERNEL) */
 /*
