@@ -27,7 +27,6 @@
  *
  * Kernel fpu methods:
  *	kfpu_allowed()
- *	kfpu_initialize()
  *	kfpu_begin()
  *	kfpu_end()
  */
@@ -43,7 +42,6 @@
 #include <asm/neon.h>
 
 #define	kfpu_allowed()		1
-#define	kfpu_initialize(tsk)	do {} while (0)
 #define	kfpu_begin()		kernel_neon_begin()
 #define	kfpu_end()		kernel_neon_end()
 

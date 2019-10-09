@@ -67,12 +67,6 @@ AC_DEFUN([ZFS_AC_KERNEL_SRC_FPU], [
 		#error Unsupported architecture
 		#endif
 
-		#include <linux/sched.h>
-
-		#if !defined(PF_KTHREAD)
-		#error PF_KTHREAD not defined
-		#endif
-
 		#ifdef HAVE_KERNEL_FPU_API_HEADER
 		#include <asm/fpu/api.h>
 		#include <asm/fpu/internal.h>
@@ -94,7 +88,6 @@ AC_DEFUN([ZFS_AC_KERNEL_SRC_FPU], [
 		struct fregs_state *fr __attribute__ ((unused)) = &st->fsave;
 		struct fxregs_state *fxr __attribute__ ((unused)) = &st->fxsave;
 		struct xregs_state *xr __attribute__ ((unused)) = &st->xsave;
-		fpu->last_cpu = -1;
 	])
 ])
 
